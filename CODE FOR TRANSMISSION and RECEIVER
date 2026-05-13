@@ -1,0 +1,452 @@
+Transmitter code()
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HardwareSerial.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+// ================= CONFIGURATION =================
+// WiFi
+const char* ssid     = "IOT";
+const char* password = "1234567890";
+
+// Telegram
+const String botToken = "7998457978:AAHq1AaIllRgB0HXQ-OiEOHUukCEHuCGMJ4";
+const String chatID   = "7394829757";
+
+// GSM (A7670C) - tera working configuration
+HardwareSerial sim(2);
+const int gsmTx = 17;   // ESP32 TX → A7670C RX
+const int gsmRx = 16;   // ESP32 RX → A7670C TX
+const String smsNumber = "+918093344602";
+
+// LoRa (RA-02 / SX1278) – 433 MHz
+#define LORA_SS   5
+#define LORA_RST  14
+#define LORA_DIO0 2
+
+// Sending interval (milliseconds)
+const unsigned long sendInterval = 30000;   // 30 seconds
+
+// ================= GLOBAL =================
+bool gsmReady = false;
+bool loraReady = false;
+
+// ================= FUNCTION PROTOTYPES =================
+// Tere chhote code ke GSM helpers (exact copy)
+void sendCmd(String cmd);
+String readResponse();
+bool waitFor(String target, int timeoutMs);
+
+// Baaki functions
+void initGSM();
+bool sendViaGSM(String message);
+bool sendViaTelegram(String message);
+String urlEncode(String str);
+void connectWiFi();
+void initLoRa();
+bool sendViaLoRa(String message);
+String sendMessageWithFallback(String data, String time);
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  sim.begin(115200, SERIAL_8N1, gsmRx, gsmTx);   // Tera working baud rate
+
+  Serial.println("\n=== OMNIEYE TX (WiFi + GSM + LoRa 433MHz) ===");
+
+  // 1. WiFi
+  connectWiFi();
+
+  // 2. GSM (using your proven init)
+  initGSM();
+
+  // 3. LoRa
+  initLoRa();
+
+  Serial.println("System ready.");
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+  static unsigned long lastSend = 0;
+  if (millis() - lastSend >= sendInterval) {
+    lastSend = millis();
+    
+    // Build a generic data message
+    String sensorData = "Temperature: 24.5C, Humidity: 60%";
+    String timestamp = String(millis() / 1000);
+    
+    String status = sendMessageWithFallback(sensorData, timestamp);
+    Serial.println("Final status: " + status);
+  }
+
+  // Keep WiFi alive
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  delay(100);
+}
+
+// ================= CORE SEND LOGIC (WiFi → GSM → LoRa) =================
+String sendMessageWithFallback(String data, String time) {
+  Serial.println("\n--- Sending data: " + data + " (time: " + time + ") ---");
+
+  // 1) Try Telegram via WiFi
+  if (WiFi.status() == WL_CONNECTED) {
+    String msg = "[✅ WiFi/Telegram] " + data + " | Time: " + time;
+    if (sendViaTelegram(msg)) {
+      Serial.println("✅ Sent via Telegram (WiFi)");
+      return "WiFi/Telegram OK";
+    }
+  }
+
+  // 2) Fallback to GSM SMS (using your working sendViaGSM)
+  if (gsmReady) {
+    String msg = "[⚠️ GSM/SMS Fallback] " + data + " | Time: " + time;
+    if (sendViaGSM(msg)) {
+      Serial.println("✅ Sent via SMS (GSM fallback)");
+      return "GSM/SMS OK";
+    } else {
+      // Retry after delay as in your proven logic
+      delay(3000);
+      if (sendViaGSM(msg)) {
+        Serial.println("✅ Sent via SMS (GSM retry)");
+        return "GSM/SMS retry OK";
+      }
+    }
+  }
+
+  // 3) Last resort: LoRa transmission
+  if (loraReady) {
+    String msg = "[📡 LoRa Fallback] " + data + " | Time: " + time;
+    if (sendViaLoRa(msg)) {
+      Serial.println("✅ Sent via LoRa (backup link)");
+      return "LoRa OK";
+    }
+  }
+
+  Serial.println("❌ FAILED: all communication channels down");
+  return "ALL FAILED";
+}
+
+// ================= TELEGRAM (WiFi) =================
+bool sendViaTelegram(String message) {
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + botToken +
+               "/sendMessage?chat_id=" + chatID +
+               "&text=" + urlEncode(message);
+
+  http.begin(url);
+  http.setTimeout(5000);
+  int httpCode = http.GET();
+  http.end();
+
+  if (httpCode == 200) return true;
+
+  Serial.println("Telegram failed, code: " + String(httpCode));
+  return false;
+}
+
+String urlEncode(String str) {
+  String encoded = "";
+  char c;
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+      encoded += c;
+    else if (c == ' ')
+      encoded += "%20";
+    else {
+      encoded += '%';
+      char hex[3];
+      sprintf(hex, "%02X", c);
+      encoded += hex;
+    }
+  }
+  return encoded;
+}
+
+// ================= GSM SMS (A7670C) – EXACTLY YOUR WORKING CODE =================
+bool sendViaGSM(String message) {
+  Serial.println("Sending via GSM...");
+
+  sim.println("AT+CMGF=1");
+  delay(200);
+
+  sim.print("AT+CMGS=\"");
+  sim.print(smsNumber);
+  sim.println("\"");
+
+  if (!waitFor(">", 5000)) {
+    Serial.println("No SMS prompt");
+    return false;
+  }
+
+  sim.print(message);
+  delay(300);
+  sim.write(26);                 // CTRL+Z
+
+  if (waitFor("+CMGS", 15000)) {
+    Serial.println("GSM sent + confirmed");
+    return true;
+  }
+
+  Serial.println("GSM send failed");
+  return false;
+}
+
+// ================= GSM INITIALISATION – EXACTLY YOUR WORKING CODE =================
+void initGSM() {
+  Serial.println("Initialising GSM...");
+
+  sendCmd("AT");
+  sendCmd("ATE0");
+  sendCmd("AT+CMGF=1");
+
+  // Wait for network registration
+  bool registered = false;
+  for (int i = 0; i < 20; i++) {   // try up to 20 sec
+    sim.println("AT+CREG?");
+    delay(1000);
+    String resp = readResponse();
+    if (resp.indexOf("0,1") != -1 || resp.indexOf("0,5") != -1) {
+      registered = true;
+      break;
+    }
+    Serial.print(".");
+  }
+
+  if (registered) {
+    gsmReady = true;
+    Serial.println("\nGSM ready ✅");
+  } else {
+    Serial.println("\nGSM not registered (SMS may fail)");
+  }
+}
+
+// ================= GSM HELPERS (teri working file se exactly copy) =================
+void sendCmd(String cmd) {
+  sim.println(cmd);
+  delay(500);
+  readResponse();   // discard
+}
+
+String readResponse() {
+  String res = "";
+  long start = millis();
+  while (millis() - start < 2000) {
+    while (sim.available()) {
+      res += (char)sim.read();
+    }
+  }
+  return res;
+}
+
+bool waitFor(String target, int timeoutMs) {
+  String response = "";
+  long start = millis();
+  while (millis() - start < timeoutMs) {
+    while (sim.available()) {
+      char c = sim.read();
+      response += c;
+      if (response.indexOf(target) != -1) return true;
+    }
+  }
+  return false;
+}
+
+// ================= LoRa INIT & SEND (433 MHz) =================
+void initLoRa() {
+  Serial.println("Initialising LoRa at 433 MHz...");
+  SPI.begin(18, 19, 23, LORA_SS);  // SCK=18, MISO=19, MOSI=23, SS=5
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(433E6)) {          // 433 MHz
+    Serial.println("LoRa init failed!");
+    loraReady = false;
+    return;
+  }
+
+  // Optional settings
+  LoRa.setSpreadingFactor(12);
+  LoRa.setTxPower(20);               // max power
+  LoRa.enableCrc();
+
+  loraReady = true;
+  Serial.println("LoRa ready ✅");
+}
+
+bool sendViaLoRa(String message) {
+  Serial.println("Sending via LoRa...");
+  LoRa.beginPacket();
+  LoRa.print(message);
+  LoRa.endPacket();
+  return true;
+}
+
+// ================= WIFI MANAGEMENT =================
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected ✅ IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nWiFi failed ❌ (GSM / LoRa will be used)");
+  }
+}
+
+
+Receiver code()
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+#define LORA_SS   5
+#define LORA_RST  14
+#define LORA_DIO0 2
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+String incomingMessage = "";
+bool newMessage = false;
+
+unsigned long lastPacketTime = 0;
+const unsigned long timeoutInterval = 5000;
+bool showingNoData = false;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== OMNIEYE RECEIVER (LoRa 433MHz + 20x4 LCD) ===");
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("LoRa Receiver");
+  lcd.setCursor(0, 1);
+  lcd.print("433 MHz");
+  lcd.setCursor(0, 2);
+  lcd.print("Waiting...");
+
+  SPI.begin(18, 19, 23, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(433E6)) {
+    Serial.println("LoRa init failed!");
+    lcd.setCursor(0, 3);
+    lcd.print("LoRa ERROR!    ");
+    while (1);
+  }
+
+  LoRa.setSpreadingFactor(12);
+  LoRa.enableCrc();
+  Serial.println("LoRa ready, listening on 433 MHz...");
+  lcd.setCursor(0, 3);
+  lcd.print("LoRa OK        ");
+  delay(2000);
+  lcd.clear();
+
+  lastPacketTime = millis();
+  showingNoData = false;
+  showNoDataScreen();
+}
+
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    incomingMessage = "";
+    while (LoRa.available()) {
+      incomingMessage += (char)LoRa.read();
+    }
+
+    int rssi = LoRa.packetRssi();
+    Serial.print("Received: ");
+    Serial.println(incomingMessage);
+    Serial.print("RSSI: ");
+    Serial.println(rssi);
+
+    newMessage = true;
+    lastPacketTime = millis();
+    if (showingNoData) {
+      showingNoData = false;
+    }
+  }
+
+  if (newMessage) {
+    displayOnLCD(incomingMessage);
+    newMessage = false;
+  }
+
+  if (!showingNoData && (millis() - lastPacketTime > timeoutInterval)) {
+    showNoDataScreen();
+    showingNoData = true;
+  }
+
+  delay(50);
+}
+
+void displayOnLCD(String msg) {
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  if (msg.length() >= 20) {
+    lcd.print(msg.substring(0, 20));
+  } else {
+    lcd.print(msg);
+    for (int i = msg.length(); i < 20; i++) lcd.print(" ");
+  }
+
+  lcd.setCursor(0, 1);
+  if (msg.length() > 20) {
+    int len = msg.length() - 20;
+    if (len > 20) len = 20;
+    lcd.print(msg.substring(20, 20 + len));
+  } else {
+    lcd.print("                    ");
+  }
+
+  lcd.setCursor(0, 2);
+  lcd.print("RSSI: ");
+  lcd.print(LoRa.packetRssi());
+  lcd.print(" dBm   ");
+
+  lcd.setCursor(0, 3);
+  if (msg.indexOf("WiFi/Telegram") != -1) {
+    lcd.print("Via: Telegram   ");
+  } else if (msg.indexOf("GSM/SMS") != -1) {
+    lcd.print("Via: SMS        ");
+  } else if (msg.indexOf("LoRa") != -1) {
+    lcd.print("Via: LoRa (backup)");
+  } else {
+    lcd.print("Unknown source ");
+  }
+}
+
+void showNoDataScreen() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("No LoRa data   ");
+  lcd.setCursor(0, 1);
+  lcd.print("Using: SMS/GSM ");
+  lcd.setCursor(0, 2);
+  lcd.print("or WiFi        ");
+  lcd.setCursor(0, 3);
+  lcd.print("(waiting for   ");
+  lcd.setCursor(12, 3);
+  lcd.print("LoRa)");
+}
